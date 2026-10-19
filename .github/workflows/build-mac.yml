@@ -1,0 +1,52 @@
+# 在 GitHub 的 Mac 云主机上打包，你在 Windows 上下载 zip 发给亲戚即可。
+name: 打包 Mac
+
+on:
+  # 在 GitHub 网页上点「Run workflow」手动打包
+  workflow_dispatch:
+  # 推送形如 v1.0.0 的标签时也会自动打包
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple Silicon（M1 / M2 / M3）
+          - os: macos-14
+            arch: apple-silicon
+          # Intel Mac
+          - os: macos-13
+            arch: intel
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖
+        run: python -m pip install -r requirements.txt
+
+      - name: PyInstaller 打包
+        run: |
+          python -m PyInstaller --noconfirm --clean --windowed --name "布料出入库" main.py
+
+      - name: 压成 zip
+        run: |
+          cd dist
+          ditto -c -k --sequesterRsrc --keepParent "布料出入库.app" "布料出入库-mac-${{ matrix.arch }}.zip"
+
+      - name: 上传产物（可在网页下载）
+        uses: actions/upload-artifact@v4
+        with:
+          name: 布料出入库-mac-${{ matrix.arch }}
+          path: dist/布料出入库-mac-${{ matrix.arch }}.zip
+          if-no-files-found: error

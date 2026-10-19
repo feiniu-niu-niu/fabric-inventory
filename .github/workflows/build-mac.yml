@@ -37,16 +37,16 @@ jobs:
 
       - name: PyInstaller 打包
         run: |
-          python -m PyInstaller --noconfirm --clean --windowed --name "布料出入库" main.py
+          python -m PyInstaller --noconfirm --clean --windowed --name "亿宝麦" main.py
 
       - name: 压成 zip
         run: |
           cd dist
-          ditto -c -k --sequesterRsrc --keepParent "布料出入库.app" "布料出入库-mac-${{ matrix.arch }}.zip"
+          ditto -c -k --sequesterRsrc --keepParent "亿宝麦.app" "亿宝麦-mac-${{ matrix.arch }}.zip"
 
       - name: 上传产物（可在网页下载）
         uses: actions/upload-artifact@v4
         with:
-          name: 布料出入库-mac-${{ matrix.arch }}
-          path: dist/布料出入库-mac-${{ matrix.arch }}.zip
+          name: 亿宝麦-mac-${{ matrix.arch }}
+          path: dist/亿宝麦-mac-${{ matrix.arch }}.zip
           if-no-files-found: error

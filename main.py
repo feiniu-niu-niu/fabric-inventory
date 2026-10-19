@@ -347,7 +347,7 @@ class FieldDialog(tk.Toplevel):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("布料出入库记录")
+        self.title("亿宝麦")
         self.geometry("1100x680")
         self.minsize(900, 560)
         self.db = Database()

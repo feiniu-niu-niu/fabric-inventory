@@ -10,7 +10,7 @@ from datetime import datetime
 def app_dir():
     """程序数据目录：开发时为源码目录；打包后为 exe/.app 所在文件夹。"""
     if getattr(sys, "frozen", False):
-        path = os.path.dirname(os.path.executable)
+        path = os.path.dirname(sys.executable)
         # macOS .app → 把数据放在 .app 旁边，避免写进应用包内部
         if sys.platform == "darwin" and path.endswith("MacOS"):
             return os.path.dirname(os.path.dirname(os.path.dirname(path)))
@@ -23,9 +23,7 @@ def db_path():
 
 
 PRODUCT_FIELDS = [
-    ("product_type", "商品类型", "text", True),
-    ("product_code", "商品编号", "text", True),
-    ("length", "长度", "text", False),
+    ("product_model", "产品型号", "text", True),
     ("color", "颜色", "text", False),
     ("unit_price", "单价", "number", False),
 ]
@@ -33,6 +31,7 @@ PRODUCT_FIELDS = [
 QTY_LABEL = "数量（米）"
 STOCK_LABEL = "当前库存（米）"
 SUMMARY_PRICE_LABEL = "单价"
+INDEX_LABEL = "序号"
 
 
 class InventoryError(Exception):
@@ -80,6 +79,10 @@ def parse_number(value, label, required=False):
     return number
 
 
+def _join_model_parts(*parts):
+    return " ".join(part.strip() for part in parts if part and str(part).strip())
+
+
 class Database:
     def __init__(self, path=None):
         self.path = path or db_path()
@@ -91,11 +94,19 @@ class Database:
     def close(self):
         self.conn.close()
 
+    def _table_columns(self, table):
+        return {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+
+    def _ensure_column(self, table, column, decl):
+        if column not in self._table_columns(table):
+            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
     def _migrate(self):
         self.conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS products (
                 id INTEGER PRIMARY KEY,
+                product_model TEXT NOT NULL DEFAULT '',
                 product_type TEXT NOT NULL DEFAULT '',
                 product_code TEXT NOT NULL DEFAULT '',
                 length TEXT NOT NULL DEFAULT '',
@@ -110,6 +121,7 @@ class Database:
                 txn_date TEXT NOT NULL,
                 io_type TEXT NOT NULL,
                 product_id INTEGER,
+                product_model TEXT NOT NULL DEFAULT '',
                 product_type TEXT NOT NULL DEFAULT '',
                 product_code TEXT NOT NULL DEFAULT '',
                 length TEXT NOT NULL DEFAULT '',
@@ -130,12 +142,54 @@ class Database:
                 sort_order INTEGER NOT NULL,
                 created_at TEXT NOT NULL
             );
-
+            """
+        )
+        # 兼容旧库：补齐产品型号列，并从「类型+编号」合并
+        self._ensure_column("products", "product_model", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("transactions", "product_model", "TEXT NOT NULL DEFAULT ''")
+        self._migrate_product_model_data()
+        self.conn.execute("DROP INDEX IF EXISTS idx_product_identity")
+        self.conn.execute(
+            """
             CREATE UNIQUE INDEX IF NOT EXISTS idx_product_identity
-            ON products(product_type, product_code, length, color);
+            ON products(product_model, color)
             """
         )
         self.conn.commit()
+
+    def _migrate_product_model_data(self):
+        for row in self.conn.execute(
+            "SELECT id, product_model, product_type, product_code FROM products"
+        ):
+            if (row["product_model"] or "").strip():
+                continue
+            model = _join_model_parts(row["product_type"], row["product_code"])
+            if model:
+                self.conn.execute(
+                    "UPDATE products SET product_model = ? WHERE id = ?",
+                    (model, row["id"]),
+                )
+        for row in self.conn.execute(
+            """
+            SELECT id, product_model, product_type, product_code, product_id
+            FROM transactions
+            """
+        ):
+            if (row["product_model"] or "").strip():
+                continue
+            model = _join_model_parts(row["product_type"], row["product_code"])
+            if not model and row["product_id"]:
+                prod = self.conn.execute(
+                    "SELECT product_model FROM products WHERE id = ?",
+                    (row["product_id"],),
+                ).fetchone()
+                if prod:
+                    model = prod["product_model"] or ""
+            if model:
+                self.conn.execute(
+                    "UPDATE transactions SET product_model = ? WHERE id = ?",
+                    (model, row["id"]),
+                )
 
     def custom_fields(self, scope=None):
         sql = "SELECT * FROM field_defs"
@@ -160,12 +214,14 @@ class Database:
                 "日期",
                 "类型",
                 "类型（入库/出库）",
+                "产品型号",
                 "单价",
                 "数量",
                 QTY_LABEL,
                 "备注",
                 "当前库存数",
                 STOCK_LABEL,
+                INDEX_LABEL,
             }
         )
         if label in builtin:
@@ -294,13 +350,11 @@ class Database:
             self.conn.execute(
                 """
                 UPDATE transactions
-                SET product_type = ?, product_code = ?, length = ?, color = ?, extra = ?
+                SET product_model = ?, color = ?, extra = ?
                 WHERE id = ?
                 """,
                 (
-                    payload["product_type"],
-                    payload["product_code"],
-                    payload["length"],
+                    payload["product_model"],
                     payload["color"],
                     _dumps(kept),
                     row["id"],
@@ -309,26 +363,19 @@ class Database:
 
     def save_product(self, data, product_id=None):
         payload = self._product_payload(data)
-        identity = (
-            payload["product_type"],
-            payload["product_code"],
-            payload["length"],
-            payload["color"],
-        )
+        identity = (payload["product_model"], payload["color"])
         dup_sql = """
             SELECT id FROM products
-            WHERE product_type = ? AND product_code = ? AND length = ? AND color = ?
+            WHERE product_model = ? AND color = ?
         """
         args = list(identity)
         if product_id:
             dup_sql += " AND id <> ?"
             args.append(product_id)
         if self.conn.execute(dup_sql, args).fetchone():
-            raise InventoryError("已有相同的商品类型、编号、长度、颜色")
+            raise InventoryError("已有相同的产品型号、颜色")
         values = (
-            payload["product_type"],
-            payload["product_code"],
-            payload["length"],
+            payload["product_model"],
             payload["color"],
             payload["unit_price"],
             _dumps(payload["extra"]),
@@ -337,8 +384,7 @@ class Database:
             self.conn.execute(
                 """
                 UPDATE products
-                SET product_type = ?, product_code = ?, length = ?, color = ?,
-                    unit_price = ?, extra = ?
+                SET product_model = ?, color = ?, unit_price = ?, extra = ?
                 WHERE id = ?
                 """,
                 (*values, product_id),
@@ -348,8 +394,8 @@ class Database:
             cur = self.conn.execute(
                 """
                 INSERT INTO products(
-                    product_type, product_code, length, color, unit_price, extra, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    product_model, color, unit_price, extra, created_at
+                ) VALUES (?, ?, ?, ?, ?)
                 """,
                 (*values, _now()),
             )
@@ -376,6 +422,10 @@ class Database:
     def _product_dict(self, row):
         item = dict(row)
         item["extra"] = _loads(item.get("extra"))
+        if not (item.get("product_model") or "").strip():
+            item["product_model"] = _join_model_parts(
+                item.get("product_type"), item.get("product_code")
+            )
         return item
 
     def list_products(self, keyword=""):
@@ -383,7 +433,7 @@ class Database:
         rows = self.conn.execute(
             """
             SELECT * FROM products
-            ORDER BY product_type, product_code, length, color, id
+            ORDER BY product_model, color, id
             """
         ).fetchall()
         items = [self._product_dict(row) for row in rows]
@@ -393,9 +443,7 @@ class Database:
 
     def product_text(self, product):
         parts = [
-            product.get("product_type") or "",
-            product.get("product_code") or "",
-            product.get("length") or "",
+            product.get("product_model") or "",
             product.get("color") or "",
         ]
         for field in self.custom_fields("product"):
@@ -404,9 +452,7 @@ class Database:
 
     def product_label(self, product):
         parts = [
-            product.get("product_type") or "",
-            product.get("product_code") or "",
-            product.get("length") or "",
+            product.get("product_model") or "",
             product.get("color") or "",
         ]
         return " / ".join(part if part else "-" for part in parts)
@@ -461,9 +507,7 @@ class Database:
                 [
                     item["txn_date"],
                     item["io_type"],
-                    item["product_type"],
-                    item["product_code"],
-                    item["length"],
+                    item.get("product_model") or "",
                     item["color"],
                     item["remark"] or "",
                     format_number(item["unit_price"]),
@@ -479,6 +523,10 @@ class Database:
     def _txn_dict(self, row):
         item = dict(row)
         item["extra"] = _loads(item.get("extra"))
+        if not (item.get("product_model") or "").strip():
+            item["product_model"] = _join_model_parts(
+                item.get("product_type"), item.get("product_code")
+            )
         return item
 
     def get_transaction(self, txn_id):
@@ -518,9 +566,7 @@ class Database:
             txn_date,
             io_type,
             product["id"],
-            product["product_type"],
-            product["product_code"],
-            product["length"],
+            product["product_model"],
             product["color"],
             unit_price,
             quantity,
@@ -531,9 +577,8 @@ class Database:
             self.conn.execute(
                 """
                 UPDATE transactions
-                SET txn_date = ?, io_type = ?, product_id = ?, product_type = ?,
-                    product_code = ?, length = ?, color = ?, unit_price = ?,
-                    quantity = ?, remark = ?, extra = ?
+                SET txn_date = ?, io_type = ?, product_id = ?, product_model = ?,
+                    color = ?, unit_price = ?, quantity = ?, remark = ?, extra = ?
                 WHERE id = ?
                 """,
                 (*values, txn_id),
@@ -542,9 +587,9 @@ class Database:
             cur = self.conn.execute(
                 """
                 INSERT INTO transactions(
-                    txn_date, io_type, product_id, product_type, product_code, length, color,
+                    txn_date, io_type, product_id, product_model, color,
                     unit_price, quantity, remark, extra, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (*values, _now()),
             )
@@ -563,10 +608,10 @@ class Database:
         self.conn.execute("DELETE FROM transactions WHERE id = ?", (txn_id,))
         self.conn.commit()
 
-    def summary(self, hide_zero=False):
+    def summary(self, hide_zero=False, keyword=""):
         stocks = self._stock_map()
         rows = []
-        for product in self.list_products():
+        for product in self.list_products(keyword):
             stock = stocks.get(product["id"], 0) or 0
             if hide_zero and abs(stock) < 1e-9:
                 continue
